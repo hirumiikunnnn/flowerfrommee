@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wildflowers</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #232741; overflow: hidden; }
+  /* fixed + inset 0 = exactly the visible area; 100vh on phones runs under the browser toolbar */
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Usage: index.html?name=Sarah  or  index.html?msg=happy%20birthday&name=Sarah
+const params = new URLSearchParams(location.search);
+const name = params.get('name');
+const MESSAGE = (params.get('msg') || 'for youu baby') + (name ? ', ' + name : '');
+
+const C = { pink: '#ff8fb8', red: '#ff3b3b', yellow: '#ffd23f', blue: '#4a6cff', purple: '#8a6cff', white: '#f2f2f2', rose: '#ff5fa2' };
+const STEM_DARK = ['#2e9e44', '#3aa84e', '#279a40'];   // near the hand
+const STEM_LIGHT = ['#6fe07c', '#82e88a', '#5fd86e'];  // near the bloom
+const LEAF = ['#4caf50', '#66bb6a', '#7cc576'];
+const STAR_CHARS = ['+', '·', '.', '*'];
+const STAR_COLORS = ['#ffffff', '#fff2c4', '#cfe8ff', '#ffd6e8'];
+const FLY_COLORS = ['#ffd6e8', '#ff8fb8', '#ffe98a', '#ffb3d1'];
+const SPIN = (Math.PI * 2) / 16000; // one full turn every 16 s
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.setAttribute('aria-label', `A slowly turning bouquet of wildflowers drawn with text characters, with glowing heart fireflies and the message "${MESSAGE}". Press any key or tap for a new one.`);
+const STILL = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+
+// Grid + projection. World: stems start at (0,0,0), y is up, the longest stem is ~1 unit.
+let cols, rows, cw, chh, size, boldFont, thinFont, ox, oy, scaleX, scaleY;
+let pts, heads, stars, dust, flies, shooting, nextShoot = 0, bornAt, stemPhase = 0;
+let W, H; // visible canvas size in CSS pixels
+
+function resize() {
+  const box = canvas.getBoundingClientRect();
+  W = box.width; H = box.height;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  size = Math.max(8, Math.floor(Math.min(W / 95, H / 58)));
+  boldFont = `bold ${size}px "Courier New", monospace`;
+  thinFont = `${size}px "Courier New", monospace`;
+  ctx.font = boldFont;
+  cw = ctx.measureText('M').width;
+  chh = size * 1.05;
+  cols = Math.floor(W / cw);
+  rows = Math.floor(H / chh);
+  const aspect = chh / cw;                        // a cell is taller than wide
+  const fitW = (cols * 0.44) / (aspect * 0.95);   // scale at which the ~0.95 radius fills ~88% of the width
+  scaleY = Math.min(rows * 0.62, fitW / 0.6);     // phones: shrink height so the bunch is not a thin spike
+  scaleX = scaleY * aspect * Math.min(1, fitW / scaleY); // never widen: it would distort the spin
+  ox = cols / 2;
+  oy = Math.min(rows * 0.8, rows / 2 + scaleY * 0.55);
+  makeSky();
+  generate();
+}
+
+// One 3D point. ch = null means "stem": glyph is picked each frame from the projected tangent.
+// w = how much the wind moves it (tips move most), ph = its stem's wind phase.
+function P(x, y, z, ch, color, t, tan) {
+  pts.push({ x, y, z, ch, color, t, tan, ph: stemPhase, w: Math.max(0, y) ** 1.6 });
+}
+
+const norm = v => { const l = Math.hypot(...v) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const mix = (a, b, u) => a.map((v, i) => v + (b[i] - v) * u);
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgb = c => `rgb(${c.map(Math.round).join(',')})`;
+
+// Flower heads are fixed character shapes (built once, in grid cells) that ride on their 3D stem tip.
+// Keeping the shape fixed means a flower never breaks apart or thins out while the bunch turns.
+// Pixel-art flowers. X = petal, O = centre, . = empty. Each pixel is drawn 2 characters wide,
+// because a character cell is about twice as tall as it is wide.
+const ART = {
+  small: ['.X.', 'XOX', '.X.'],                                   // 4-petal bloom
+  round: ['.XXX.', 'XXXXX', 'XXOXX', 'XXXXX', '.XXX.'],         // round bloom
+  mid:   ['.X.X.', 'XXOXX', '.X.X.'],                             // small notched bloom (phones)
+  big:   ['..X.X..', '.XXXXX.', 'XXXOXXX', '.XXXXX.', '..X.X..'], // daisy with scalloped petals
+  star:  ['X.X.X', '.XXX.', 'XXOXX', '.XXX.', 'X.X.X'],           // cornflower burst
+  cup:   ['X.X.X', 'XXXXX', 'XXXXX', '.XXX.'],                    // tulip cup, sits on top of the stem
+};
+function art(name, petal, centre) {
+  const g = ART[name], h = g.length, w = g[0].length, cells = [];
+  const top = name === 'cup' ? -(h - 1) : -Math.floor(h / 2); // cup sits on the stem tip, others centre on it
+  g.forEach((row, y) => [...row].forEach((v, x) => {
+    if (v === '.') return;
+    const [ch, color] = v === 'O' ? centre : petal;
+    for (let k = 0; k < 2; k++) cells.push([(x - (w - 1) / 2) * 2 + k - 1, top + y, ch, color]);
+  }));
+  return cells;
+}
+
+const HEADS = [
+  () => art(scaleY < 40 ? pick(['small', 'mid']) : pick(['round', 'big']), ['o', C.white], ['@', C.yellow]),                    // daisy
+  () => art(scaleY < 40 ? pick(['small', 'mid']) : pick(['round', 'big']), ['o', pick([C.pink, C.rose])], ['*', C.yellow]),     // cosmos
+  () => art('cup', ['@', pick([C.red, C.rose, C.yellow])], null),                        // tulip
+  () => art(scaleY < 40 ? 'mid' : 'round', ['#', C.red], ['●', '#3a1020']),                                     // poppy
+  () => art('star', ['*', C.blue], ['o', C.white]),                                       // cornflower
+  () => art('small', ['o', pick([C.yellow, C.pink, C.white, C.blue])], ['.', '#ff9f1c']), // little bloom
+  () => {                                                                                 // lavender spike, points up
+    const out = [], len = Math.round(rand(0.1, 0.18) * scaleY);
+    for (let dy = 0; dy < len; dy++) { out.push([0, -dy, '8', C.purple]); if (dy % 2) out.push([1, -dy, '8', C.purple]); }
+    return out;
+  },
+];
+const SMALL_HEADS = [HEADS[5], HEADS[2], HEADS[4]];
+const addHead = (c, make, t) => heads.push({ c, cells: make(), t, ph: stemPhase, w: Math.max(0, c[1]) ** 1.6 });
+
+function stemChar(dx, dy) {
+  const a = Math.atan2(dx, -dy); // 0 = straight up on screen
+  if (Math.abs(a) < 0.3 || Math.abs(a) > Math.PI - 0.3) return '|';
+  if (Math.abs(a) > 1.25 && Math.abs(a) < Math.PI - 1.25) return '-';
+  return (a > 0) === (Math.abs(a) < Math.PI / 2) ? '/' : '\\';
+}
+
+// A leaf: short curved line of points leaving the stem sideways and up.
+function leaf(p, side, t) {
+  const up = [0, 1, 0], len = rand(0.04, 0.07), color = pick(LEAF);
+  for (let s = 0; s <= len; s += 0.5 / scaleY) {
+    const k = s / len;
+    P(p[0] + side[0] * s, p[1] + up[1] * s * (0.3 + k * 0.6), p[2] + side[2] * s, k < 0.5 ? '~' : pick([')', '(']), color, t);
+  }
+}
+
+function generate() {
+  pts = [];
+  heads = [];
+  // fewer flowers when the bouquet is small (phones), so they don't merge into one band
+  const stems = Math.round(rand(22, 30) * Math.min(1, Math.max(0.6, scaleY / 50)));
+  for (let s = 0; s < stems; s++) {
+    const theta = rand(0.2, 1.0), phi = rand(0, Math.PI * 2); // tilt from vertical, direction around the bunch
+    const L = rand(0.45, 1);
+    const out = [Math.cos(phi), 0, Math.sin(phi)];
+    stemPhase = phi * 0.7 + rand(-0.5, 0.5);
+    // Cubic curve: leaves the hand fairly upright, bows outward, tip droops a little with weight (gravity).
+    const sinT = Math.sin(theta), cosT = Math.cos(theta);
+    const P1 = [out[0] * sinT * 0.35 * L * 0.4, cosT * 0.4 * L + 0.1 * L, out[2] * sinT * 0.35 * L * 0.4];
+    const P2 = [out[0] * sinT * L * 0.75, cosT * L * 0.85, out[2] * sinT * L * 0.75];
+    const P3 = [out[0] * sinT * L, cosT * L - sinT * sinT * 0.12 * L, out[2] * sinT * L];
+    const dark = hex(pick(STEM_DARK)), light = hex(pick(STEM_LIGHT));
+    const grow = rand(0.45, 0.7);                              // when this stem finishes growing (0..1)
+    const wob = rand(0, 6.28), wobA = rand(0.004, 0.012);      // tiny wobble so stems are not perfect curves
+    const n = Math.ceil(L * scaleY * 2.4);
+    let tan = [0, 1, 0], p = [0, 0, 0];
+    for (let i = 1; i <= n; i++) {
+      const u = i / n, v = 1 - u;
+      const b0 = 3 * v * v * u, b1 = 3 * v * u * u, b2 = u * u * u;
+      const w = Math.sin(u * 9 + wob) * wobA;
+      p = [0, 1, 2].map(k => b0 * P1[k] + b1 * P2[k] + b2 * P3[k]);
+      p[0] += out[2] * w; p[2] -= out[0] * w;
+      tan = [0, 1, 2].map(k => 3 * v * v * P1[k] + 6 * v * u * (P2[k] - P1[k]) + 3 * u * u * (P3[k] - P2[k]));
+      P(p[0], p[1], p[2], null, rgb(mix(dark, light, u)), u * grow, tan);
+      if (Math.random() < 0.05 && u > 0.25 && u < 0.75) {
+        const sd = Math.random() < 0.5 ? 1 : -1;
+        leaf(p, [out[2] * sd * 0.7 + out[0] * 0.3, 0, -out[0] * sd * 0.7 + out[2] * 0.3], u * grow);
+      }
+      if (Math.random() < 0.01 && u > 0.6 && u < 0.9) addHead(p, pick(SMALL_HEADS), u * grow + 0.05); // small side bloom
+    }
+    addHead(p, pick(HEADS), grow + rand(0, 0.1));
+  }
+  bornAt = performance.now();
+}
+
+// Sky: tiny dust dots (depth), twinkling glyph stars, heart fireflies.
+function makeSky() {
+  dust = Array.from({ length: Math.round(W * H / 2500) }, () => ({
+    x: rand(0, W), y: rand(0, H), r: rand(0.4, 1.1), a: rand(0.15, 0.5), ph: rand(0, 6.28), sp: rand(0.3, 1.2),
+  }));
+  stars = Array.from({ length: Math.round(cols * rows / 220) }, () => ({
+    x: Math.floor(rand(0, cols)), y: Math.floor(rand(0, rows - 3)),
+    ch: pick(STAR_CHARS), color: pick(STAR_COLORS), ph: rand(0, 6.28), sp: rand(0.5, 1.6), glow: Math.random() < 0.15,
+  }));
+  flies = Array.from({ length: Math.max(10, Math.round(W * H / 45000)) }, () => ({
+    x: rand(0, 1), y: rand(0, 1), ph: rand(0, 6.28), ph2: rand(0, 6.28), sp: rand(0.6, 1.4),
+    rise: rand(4, 10), color: pick(FLY_COLORS),
+    b: Math.random() < 0.85 ? 0 : 1, px: Math.max(6, Math.round(size * rand(0.6, 0.8))),
+  }));
+  heartCache.clear(); // glyph size changes with the window
+}
+
+function drawSky(now, buf) {
+  const t = STILL ? 0 : now / 1000;
+  for (const d of dust) {
+    ctx.globalAlpha = d.a * (0.6 + 0.4 * Math.sin(t * d.sp + d.ph));
+    ctx.fillStyle = '#dfe6ff';
+    ctx.fillRect(d.x, d.y, d.r, d.r);
+  }
+  ctx.font = thinFont;
+  for (const s of stars) {
+    if (buf.has(s.y * cols + s.x)) continue;
+    const tw = Math.max(0, Math.sin(t * s.sp + s.ph));
+    ctx.globalAlpha = STILL ? 0.6 : 0.15 + 0.85 * tw * tw;
+    ctx.fillStyle = s.color;
+    if (s.glow) { ctx.shadowColor = s.color; ctx.shadowBlur = 8 * tw; }
+    ctx.fillText(s.glow ? '✦' : s.ch, s.x * cw, s.y * chh);
+    ctx.shadowBlur = 0;
+  }
+
+  // shooting star now and then
+  if (!STILL) {
+    if (!shooting && now > nextShoot) {
+      shooting = { t0: now, x: rand(0.1, 0.9) * W, y: rand(0.02, 0.3) * H, dx: rand(-1, 1) < 0 ? -1 : 1 };
+    }
+    if (shooting) {
+      const k = (now - shooting.t0) / 900;
+      if (k > 1) { shooting = null; nextShoot = now + rand(5000, 11000); }
+      else {
+        const len = Math.min(W, H) * 0.25;
+        const hx = shooting.x + shooting.dx * len * k * 1.5, hy = shooting.y + len * k * 0.6;
+        const g = ctx.createLinearGradient(hx, hy, hx - shooting.dx * len * 0.5, hy - len * 0.2);
+        g.addColorStop(0, 'rgba(255,255,255,0.9)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.globalAlpha = 1 - k;
+        ctx.strokeStyle = g; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx - shooting.dx * len * 0.5, hy - len * 0.2); ctx.stroke();
+      }
+    }
+  }
+}
+
+// Pixel hearts built from code characters, like the flowers.
+const HEART_BITMAPS = [
+  ['.#.#.', '#####', '.###.', '..#..'],
+  ['.##.##.', '#######', '#######', '.#####.', '..###..', '...#...'],
+];
+const heartCache = new Map();
+// Draw each heart (shape, colour, glyph size) once to an offscreen canvas with its glow, then reuse it.
+function heartSprite(b, color, px) {
+  const key = b + color + px;
+  if (heartCache.has(key)) return heartCache.get(key);
+  const rowsB = HEART_BITMAPS[b], gw = px * 0.62, gh = px, pad = 10;
+  // drawn at the screen's real pixel density, otherwise phones (dpr ~3) stretch it and it blurs
+  const dpr = window.devicePixelRatio || 1, c = document.createElement('canvas');
+  c.cssW = Math.ceil(rowsB[0].length * gw + pad * 2);
+  c.cssH = Math.ceil(rowsB.length * gh + pad * 2);
+  c.width = Math.ceil(c.cssW * dpr);
+  c.height = Math.ceil(c.cssH * dpr);
+  const g = c.getContext('2d');
+  g.scale(dpr, dpr);
+  g.font = `bold ${px}px "Courier New", monospace`;
+  g.textBaseline = 'top';
+  g.fillStyle = color;
+  g.shadowColor = color;
+  g.shadowBlur = 2; // small glow keeps the character pixels sharp
+  rowsB.forEach((row, y) => [...row].forEach((v, x) => {
+    if (v === '#') g.fillText(x + y < 2 ? '+' : '#', pad + x * gw, pad + y * gh); // '+' = little highlight
+  }));
+  heartCache.set(key, c);
+  return c;
+}
+
+// Heart fireflies drift up slowly, wander, and pulse with a soft glow (drawn over the bouquet).
+function drawFlies(now) {
+  const t = STILL ? 0 : now / 1000;
+  for (const f of flies) {
+    const span = H + 40;
+    const x = f.x * W + Math.sin(t * 0.35 * f.sp + f.ph) * 45 + Math.sin(t * 0.9 + f.ph2) * 12;
+    const y = (((f.y * span - t * f.rise) % span) + span) % span - 20 + Math.cos(t * 0.5 * f.sp + f.ph) * 18;
+    const pulse = STILL ? 0.7 : Math.max(0, Math.sin(t * 1.3 * f.sp + f.ph)) ** 2;
+    ctx.globalAlpha = 0.3 + 0.7 * pulse;
+    const spr = heartSprite(f.b, f.color, f.px);
+    ctx.drawImage(spr, Math.round(x - spr.cssW / 2), Math.round(y - spr.cssH / 2), spr.cssW, spr.cssH);
+  }
+}
+
+function draw(now) {
+  const grown = STILL ? 1 : Math.min(1, (now - bornAt) / 1200); // bouquet grows in over 1.2 s
+  const ang = STILL ? 0.6 : now * SPIN, ca = Math.cos(ang), sa = Math.sin(ang);
+  const wind = STILL ? 0 : now / 1300;
+
+  // Rotate around the vertical axis, add wind, project, keep the nearest point per grid cell (z-buffer).
+  const buf = new Map();
+  for (const p of pts) {
+    if (p.t > grown) continue;
+    const X = p.x * ca + p.z * sa + Math.sin(wind + p.ph) * 0.03 * p.w;
+    const Z = -p.x * sa + p.z * ca;
+    const fx = ox + X * scaleX, gx = Math.round(fx), gy = Math.round(oy - p.y * scaleY); // fx: exact x, drawn unsnapped so the spin glides
+    if (gx < 0 || gy < 0 || gx >= cols || gy >= rows - 3) continue;
+    const key = gy * cols + gx, old = buf.get(key);
+    if (old && old.Z >= Z) continue;
+    buf.set(key, { fx, gy, Z, p });
+  }
+
+  // Flowers: whole shapes, far ones first so nearer flowers cover them. A stem only hides
+  // a flower when it is clearly in front of it.
+  const hs = [];
+  for (const h of heads) {
+    if (h.t > grown) continue;
+    const X = h.c[0] * ca + h.c[2] * sa + Math.sin(wind + h.ph) * 0.03 * h.w;
+    const Z = -h.c[0] * sa + h.c[2] * ca;
+    hs.push({ fx: ox + X * scaleX, gx: Math.round(ox + X * scaleX), gy: Math.round(oy - h.c[1] * scaleY), Z, h });
+  }
+  hs.sort((a, b) => a.Z - b.Z);
+  for (const { fx, gx, gy, Z, h } of hs)
+    for (const [dx, dy, ch, color] of h.cells) {
+      const x = gx + dx, y = gy + dy;
+      if (x < 0 || y < 0 || x >= cols || y >= rows - 3) continue;
+      const key = y * cols + x, old = buf.get(key);
+      if (old && !old.head && old.Z > Z + 0.15) continue;
+      buf.set(key, { fx: fx + dx, gy: y, Z, p: { ch, color }, head: true });
+    }
+
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#232741';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textBaseline = 'top';
+  drawSky(now, buf);
+
+  // stems in a thin font and a little faded so they read as soft stalks; blooms bold on top
+  for (const pass of [0, 1]) {
+    ctx.font = pass ? boldFont : thinFont;
+    for (const { fx, gy, Z, p } of buf.values()) {
+      const isStem = !p.ch;
+      if (isStem === !!pass) continue;
+      let ch = p.ch;
+      if (isStem) {
+        const tx = p.tan[0] * ca + p.tan[2] * sa;
+        ch = stemChar(tx * scaleX, -p.tan[1] * scaleY);
+      }
+      const depth = Math.min(1, Math.max(0, (Z + 1) / 2));         // back of the bunch is dimmer
+      ctx.globalAlpha = isStem ? 0.7 + 0.3 * depth : 0.45 + 0.55 * depth; // stems stay bright green, back blooms dimmer
+      ctx.fillStyle = p.color;
+      ctx.fillText(ch, fx * cw, gy * chh);
+    }
+  }
+
+  drawFlies(now);
+
+  ctx.globalAlpha = 1;
+  ctx.font = boldFont;
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = C.rose;
+  ctx.textAlign = 'center';
+  ctx.fillText(MESSAGE, W / 2, H - chh * 2.5, W - 32); // maxWidth squeezes long messages to fit
+  ctx.textAlign = 'left';
+  requestAnimationFrame(draw);
+}
+
+addEventListener('resize', resize);
+addEventListener('keydown', e => { if (!e.repeat) generate(); });
+canvas.addEventListener('pointerdown', generate);
+resize();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
