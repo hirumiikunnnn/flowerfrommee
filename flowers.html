@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>Click To Add Flowers</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; cursor: crosshair; }
+  #intro {
+    position: fixed; inset: 0; display: grid; place-items: center; padding: 24px;
+    margin: 0; pointer-events: none; text-align: center; color: #f1e9e5;
+    font: 400 clamp(26px, 6.5vw, 48px)/1.15 Georgia, "Times New Roman", serif;
+    letter-spacing: -.035em; transition: opacity .7s ease;
+    text-shadow: 0 0 24px #fff4;
+  }
+  #intro.hidden { opacity: 0; }
+</style>
+</head>
+<body>
+<h1 id="intro">Click To Add Flowers</h1>
+<script type="module">
+const intro = document.querySelector('#intro');
+try {
+  const THREE = await import('https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js');
+  start(THREE);
+} catch (error) {
+  intro.textContent = 'The garden needs WebGL 2 and an internet connection.';
+  console.error(error);
+}
+
+function start(T) {
+  const renderer = new T.WebGLRenderer({ antialias: false, alpha: false });
+  renderer.autoClear = false;
+  renderer.setClearColor(0x000000, 1);
+  const canvas = renderer.domElement;
+  canvas.setAttribute('aria-label', 'Flower garden. Press Enter to plant or Space to clear.');
+  canvas.tabIndex = 0;
+  document.body.prepend(canvas);
+
+  const camera = new T.OrthographicCamera(0, 1, 1, 0, 0, 10);
+  camera.position.z = 1;
+  const plane = new T.PlaneGeometry(1, 1);
+  const backdrop = new T.Scene();
+  const paint = new T.Scene();
+  const atmosphere = new T.Scene();
+  const size = new T.Vector2();
+  const colors = [0xe0218a, 0xff4fa3, 0xff7a3d, 0x9b5cff, 0xffca57];
+  // Petal length, tip roundness, aspect ratio, and inner-ring strength.
+  const forms = [
+    { length: .60, roundness: .65, aspect: 1.04, layers: .00 }, // Rounded
+    { length: .81, roundness: 1.65, aspect: 1.12, layers: .00 }, // Star-shaped
+    { length: .46, roundness: .37, aspect: .89, layers: .42 },  // Ruffled
+    { length: .72, roundness: .95, aspect: 1.25, layers: .85 }  // Layered
+  ];
+  const stemDuration = 600;
+  const bloomDuration = 800;
+  // Add ?auto=1 to the URL to enable hands-free planting for recordings.
+  const autoplay = new URLSearchParams(location.search).get('auto') === '1';
+  const active = [];
+  const finished = [];
+  let width, height, ratio, read, write;
+  let nextAuto = performance.now() + 5000;
+
+  const vertex = `
+    varying vec2 uvLocal;
+    varying vec2 pixel;
+    void main() {
+      uvLocal = uv;
+      vec4 world = modelMatrix * vec4(position, 1.);
+      pixel = world.xy;
+      gl_Position = projectionMatrix * viewMatrix * world;
+    }
+  `;
+
+  const copy = new T.ShaderMaterial({
+    uniforms: { image: { value: null } },
+    vertexShader: vertex,
+    fragmentShader: `
+      uniform sampler2D image;
+      varying vec2 uvLocal;
+      void main() { gl_FragColor = texture2D(image, uvLocal); }
+    `,
+    depthTest: false, depthWrite: false
+  });
+  const sheet = new T.Mesh(plane, copy);
+  backdrop.add(sheet);
+
+  const stemShader = `
+    varying vec2 pixel;
+    uniform vec2 tip;
+    uniform float bend, weight, growth, seed;
+    void main() {
+      float t = clamp(pixel.y / max(1., tip.y), 0., 1.);
+      float s = sin(3.141593 * t);
+      float x = tip.x + bend * (1. - t) + .55 * bend * s * (.45 + t);
+      float slope = (-bend + .55 * bend * (s + 3.141593 * cos(3.141593*t) * (.45+t))) / max(1., tip.y);
+      float d = abs(pixel.x - x) * inversesqrt(1. + slope*slope);
+      float w = weight * mix(1., .48, t);
+      float line = 1. - smoothstep(w * .27, w * .8 + .65, d);
+      float halo = exp(-d * d / (4.6*w*w + 2.)) * .19;
+      float end = growth * tip.y - pixel.y;
+      float reveal = smoothstep(-1., 1.5, end) * step(.0001, growth);
+      float alpha = (line * .86 + halo * (1. - line)) * reveal;
+      vec3 green = mix(vec3(.09,.33,.14), vec3(.46,.80,.29), .28 + .53*t);
+      green *= .90 + .10*sin(t * 27. + seed);
+      gl_FragColor = vec4(green * alpha, alpha);
+    }
+  `;
+
+  const bloomShader = `
+    varying vec2 pixel;
+    uniform vec2 tip;
+    uniform vec3 tint;
+    uniform float radius, petals, rotation, growth, seed;
+    uniform float lengthOfPetal, roundness, aspect, layers, centerSize;
+
+    float hash(vec2 p) {
+      vec3 q = fract(vec3(p.xyx) * .1031);
+      q += dot(q, q.yzx + 33.33);
+      return fract((q.x + q.y) * q.z);
+    }
+    float noise(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      f = f*f*(3.-2.*f);
+      return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+                 mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+    }
+
+    void main() {
+      float open = 1. - pow(1. - growth, 3.);
+      vec2 p = (pixel - tip) / (radius * mix(.12, 1., open));
+      float tilt = sin(seed) * .65;
+      float c = cos(tilt), s = sin(tilt);
+      p = mat2(c, s, -s, c) * p;
+      p.y *= aspect;
+      float r = length(p);
+      if (r > 1.7) discard;
+      float angle = atan(p.y, p.x + .00001) + rotation + (1. - open)*.40;
+      float grain = noise(p*37. + seed);
+      float wash = noise(p*8.6 + seed);
+      float phase = petals*angle + .22*sin(3.*angle + seed) + .18*(wash-.5);
+      float lobe = .5 + .5*cos(phase);
+      float spread = lengthOfPetal * (.85 + .15 * sin(angle*3. + seed));
+      float edge = 1. - lengthOfPetal + spread*pow(lobe, roundness);
+      edge += .050*(wash-.5) + .024*(grain-.5) + .048*sin(3.*angle + seed);
+      float veil = 1. - smoothstep(edge-.14, edge+.07, r);
+      float innerLobe = .5 + .5*cos(phase + 2.7);
+      float innerEdge = .21 + .46*pow(innerLobe, .72) + .06*(wash-.5);
+      float inner = layers * (1. - smoothstep(innerEdge-.075, innerEdge+.04, r));
+      float rimDistance = (r-innerEdge)*29.;
+      float rim = layers * exp(-rimDistance*rimDistance) * .24;
+      float fibers = sin(petals*7.*angle + 9.*wash + 12.*r) * .5 + .5;
+      float pigment = (.65 + .23*wash + .13*fibers) * (.89 + .18*grain);
+      float glow = .22*exp(-pow(max(0.,r-edge)*5.2,1.5)) * exp(-1.4*r*r);
+      float center = r / centerSize;
+      float core = exp(-center*center*10.);
+      float heart = exp(-center*center*92.);
+      float pollen = step(.69, grain) * smoothstep(.07,.13,center)
+                   * (1.-smoothstep(.20,.29,center));
+      float opacity = smoothstep(0., .24, growth);
+      float alpha = min(1., veil*pigment*.91 + glow*(1.-veil) + .10*inner + rim + .11*heart) * opacity;
+      vec3 color = mix(tint * (.85 + .23*lobe), vec3(1., .72, .29), core*.86);
+      color = mix(color, mix(tint, vec3(1., .71, .76), .55), (inner*.25 + rim) * (1.-core));
+      color = mix(color, vec3(1., .98, .83), max(heart*.92, pollen*.70));
+      gl_FragColor = vec4(color * alpha, alpha);
+    }
+  `;
+
+  function brush(fragmentShader, uniforms) {
+    return new T.Mesh(plane, new T.ShaderMaterial({
+      vertexShader: vertex, fragmentShader, uniforms, transparent: true,
+      premultipliedAlpha: true, depthTest: false, depthWrite: false
+    }));
+  }
+
+  function place(mesh, x, y, w, h) {
+    mesh.position.set(x, y, 0);
+    mesh.scale.set(w, h, 1);
+  }
+
+  function mark(flower) {
+    const tip = { value: new T.Vector2(flower.x * width, flower.y * height) };
+    const seed = { value: flower.seed };
+    const stemGrowth = { value: 0 };
+    const bloomGrowth = { value: 0 };
+    const unit = Math.min(width, height * .9);
+    const bend = flower.bend * unit;
+    const weight = Math.max(.8, Math.min(2.5, unit / 320)) * flower.weight;
+    const radius = Math.max(18, unit * flower.radius);
+    const [x, y] = tip.value;
+    const stem = brush(stemShader, {
+      tip, seed, growth: stemGrowth, bend: { value: bend }, weight: { value: weight }
+    });
+    const left = Math.min(x, x + bend) - 12;
+    const right = Math.max(x, x + bend) + 12;
+    place(stem, (left + right) / 2, (y + 2) / 2, right - left, y + 2);
+    const bloom = brush(bloomShader, {
+      tip, seed, growth: bloomGrowth, radius: { value: radius },
+      tint: { value: new T.Color().setHex(flower.color, T.LinearSRGBColorSpace) },
+      petals: { value: flower.petals }, rotation: { value: flower.rotation },
+      lengthOfPetal: { value: flower.form.length }, roundness: { value: flower.form.roundness },
+      aspect: { value: flower.form.aspect }, layers: { value: flower.form.layers },
+      centerSize: { value: flower.centerSize }
+    });
+    place(bloom, x, y, radius * 3.9, radius * 3.9);
+    return { stem, bloom, stemGrowth, bloomGrowth };
+  }
+
+  function addMark(brushes, progress, order) {
+    const stem = Math.min(1, Math.max(0, progress / stemDuration));
+    brushes.stemGrowth.value = stem * (2 - stem);
+    brushes.bloomGrowth.value = Math.min(1, Math.max(0, (progress - stemDuration) / bloomDuration));
+    brushes.stem.renderOrder = order * 2;
+    brushes.bloom.renderOrder = order * 2 + 1;
+    paint.add(brushes.stem);
+    if (brushes.bloomGrowth.value > 0) paint.add(brushes.bloom);
+  }
+
+  function dispose(brushes) {
+    brushes.stem.material.dispose();
+    brushes.bloom.material.dispose();
+  }
+
+  function pass(source, target) {
+    renderer.setRenderTarget(target);
+    if (source) {
+      copy.uniforms.image.value = source.texture;
+      renderer.render(backdrop, camera);
+    } else {
+      renderer.clearColor();
+    }
+    if (paint.children.length) renderer.render(paint, camera);
+    paint.clear();
+  }
+
+  const random = Math.random;
+  const positions = new Float32Array(60 * 3);
+  const seeds = new Float32Array(60);
+  for (let i = 0; i < seeds.length; i++) {
+    positions[3*i] = random();
+    positions[3*i+1] = random();
+    seeds[i] = random();
+  }
+  const sparkGeo = new T.BufferGeometry();
+  sparkGeo.setAttribute('position', new T.BufferAttribute(positions, 3));
+  sparkGeo.setAttribute('seed', new T.BufferAttribute(seeds, 1));
+  const sparkMaterial = new T.ShaderMaterial({
+    uniforms: { time: { value: 0 }, dpr: { value: 1 } },
+    vertexShader: `
+      attribute float seed;
+      uniform float time, dpr;
+      varying float light;
+      void main() {
+        vec2 p = fract(position.xy + vec2(.017*sin(time*.36+seed*28.), time*(.008+.008*seed)));
+        light = (.15+.53*pow(.5+.5*sin(time*(1.1+seed)+seed*51.), 2.))
+                * smoothstep(0.,.025,p.y) * smoothstep(0.,.025,1.-p.y);
+        gl_Position = vec4(p*2.-1.,0.,1.);
+        gl_PointSize = dpr*(2.1+2.5*seed);
+      }
+    `,
+    fragmentShader: `
+      varying float light;
+      void main() {
+        float d = length(gl_PointCoord-.5);
+        float a = (exp(-d*d*37.)*.85 + .15*(1.-smoothstep(.18,.49,d))) * light;
+        gl_FragColor = vec4(1.,1.,1.,a);
+      }
+    `,
+    transparent: true, depthTest: false, depthWrite: false
+  });
+  const sparkles = new T.Points(sparkGeo, sparkMaterial);
+  sparkles.frustumCulled = false;
+  atmosphere.add(sparkles);
+
+  function resize() {
+    width = Math.max(1, innerWidth);
+    height = Math.max(1, innerHeight);
+    ratio = Math.min(devicePixelRatio || 1, 2);
+    renderer.setPixelRatio(ratio);
+    renderer.setSize(width, height);
+    renderer.getDrawingBufferSize(size);
+    camera.right = width;
+    camera.top = height;
+    camera.updateProjectionMatrix();
+    place(sheet, width / 2, height / 2, width, height);
+    sparkMaterial.uniforms.dpr.value = ratio;
+
+    read?.dispose();
+    write?.dispose();
+    const options = { depthBuffer: false, stencilBuffer: false };
+    read = new T.WebGLRenderTarget(size.x, size.y, options);
+    write = new T.WebGLRenderTarget(size.x, size.y, options);
+    const replay = finished.map(mark);
+    replay.forEach((brushes, index) => addMark(brushes, stemDuration + bloomDuration, index));
+    pass(null, read);
+    replay.forEach(dispose);
+    for (const flower of active) {
+      dispose(flower.brushes);
+      flower.brushes = mark(flower);
+    }
+    renderer.setRenderTarget(null);
+  }
+
+  function plant(x, y, now) {
+    const flower = {
+      x, y, time: now, color: colors[Math.floor(random() * colors.length)],
+      bend: (random() - .5) * .29, weight: .79 + random() * .45,
+      radius: .032 + random() * .064, seed: random() * 90,
+      form: forms[Math.floor(random() * forms.length)], centerSize: .69 + .55 * random(),
+      petals: 5 + Math.floor(random() * 4), rotation: random() * Math.PI * 2
+    };
+    flower.brushes = mark(flower);
+    active.push(flower);
+    intro.classList.add('hidden');
+  }
+
+  function recordInput(now) {
+    nextAuto = now + 5000;
+  }
+
+  canvas.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const now = performance.now();
+    recordInput(now);
+    const bounds = canvas.getBoundingClientRect();
+    plant((event.clientX - bounds.left) / bounds.width, 1 - (event.clientY - bounds.top) / bounds.height, now);
+  });
+
+  addEventListener('keydown', (event) => {
+    if (event.code !== 'Space' && event.code !== 'Enter') return;
+    event.preventDefault();
+    if (event.repeat) return;
+    const now = performance.now();
+    recordInput(now);
+    if (event.code === 'Enter') {
+      plant(.12 + random() * .76, .18 + random() * .68, now);
+      return;
+    }
+    active.forEach((flower) => dispose(flower.brushes));
+    active.length = 0;
+    finished.length = 0;
+    pass(null, read);
+    pass(null, write);
+    renderer.setRenderTarget(null);
+    intro.classList.remove('hidden');
+  });
+
+  function frame(now) {
+    if (ratio !== Math.min(devicePixelRatio || 1, 2)) resize();
+    if (autoplay && now >= nextAuto) {
+      plant(.09 + random() * .82, .17 + random() * .70, now);
+      nextAuto = now + 1500;
+    }
+
+    // Commit each completed flower once. The other target holds a fresh
+    // composite during growth, so translucent brush edges never build up.
+    let committed = 0;
+    while (committed < active.length && now - active[committed].time >= stemDuration + bloomDuration) {
+      const flower = active[committed];
+      addMark(flower.brushes, stemDuration + bloomDuration, committed);
+      committed++;
+    }
+    if (committed) {
+      pass(read, write);
+      [read, write] = [write, read];
+      for (const flower of active.splice(0, committed)) {
+        dispose(flower.brushes);
+        delete flower.brushes;
+        finished.push(flower);
+      }
+    }
+
+    let visible = read;
+    if (active.length) {
+      active.forEach((flower, index) => addMark(flower.brushes, now - flower.time, index));
+      pass(read, write);
+      visible = write;
+    }
+    pass(visible, null);
+    sparkMaterial.uniforms.time.value = now * .001;
+    renderer.render(atmosphere, camera);
+    requestAnimationFrame(frame);
+  }
+
+  addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
