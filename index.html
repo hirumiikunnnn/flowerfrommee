@@ -3,532 +3,416 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wildflower Garden</title>
+<meta name="theme-color" content="#000000">
+<title>Click To Add Flowers</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #1c1f3a; overflow: hidden; }
-  /* fixed + inset 0 = exactly the visible area; 100vh on phones runs under the browser toolbar */
-  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; cursor: crosshair; }
+  #intro {
+    position: fixed; inset: 0; display: grid; place-items: center; padding: 24px;
+    margin: 0; pointer-events: none; text-align: center; color: #f1e9e5;
+    font: 400 clamp(26px, 6.5vw, 48px)/1.15 Georgia, "Times New Roman", serif;
+    letter-spacing: -.035em; transition: opacity .7s ease;
+    text-shadow: 0 0 24px #fff4;
+  }
+  #intro.hidden { opacity: 0; }
 </style>
 </head>
 <body>
-<canvas id="c"></canvas>
-<script>
-// Usage: garden.html?name=Sarah  or  garden.html?msg=happy%20birthday&name=Sarah
-const params = new URLSearchParams(location.search);
-const name = params.get('name');
-const MESSAGE = (params.get('msg') || 'a whole garden for youu ♡') + (name ? ', ' + name : '');
-
-const SKY_TOP = '#141733', SKY_LOW = '#3a2448', GLOW = '#7a3a5e', GROUND = '#120f1f';
-const C = { pink: '#ff8fb8', red: '#ff3b5c', deep: '#b3122e', yellow: '#ffd23f', blue: '#6a7cff', purple: '#a07cff', white: '#fff1f5', rose: '#ff5fa2', blush: '#ffc2d6', orange: '#ff9f1c' };
-const STEM_DARK = ['#2e9e44', '#3aa84e', '#279a40'];   // near the ground
-const STEM_LIGHT = ['#6fe07c', '#82e88a', '#5fd86e'];  // near the bloom
-const LEAF = ['#4caf50', '#66bb6a', '#7cc576'];
-const GRASS = ['#2f7d3d', '#3a8f47', '#2a6e37', '#46a052'];
-const STAR_CHARS = ['+', '·', '.', '*'];
-const STAR_COLORS = ['#ffffff', '#fff2c4', '#ffd6e8', '#ffe3ef'];
-const FLY_COLORS = ['#ffd6e8', '#ff8fb8', '#ffe98a', '#ffb3d1', '#ff6f9f'];
-
-// Camera: circles the heart-shaped garden once every 40 s, above it, looking down at it.
-const ORBIT = (Math.PI * 2) / 40000;
-const FIELD_R = 4;     // garden size (world units; a tall flower is ~0.7)
-const CAM_D = 5.6;     // camera distance from the garden centre
-const CAM_H = 4.2;     // camera height (high enough to see the heart shape)
-const PITCH = 0.62;    // how far the camera looks down (radians)
-
-const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
-canvas.setAttribute('aria-label', `A heart-shaped garden of wildflowers bordered with red roses, drawn with text characters under a moonlit starry sky, slowly circling, with glowing heart fireflies and the message "${MESSAGE}". Tap for a new garden.`);
-const STILL = matchMedia('(prefers-reduced-motion: reduce)').matches;
-const rand = (a, b) => a + Math.random() * (b - a);
-const pick = arr => arr[Math.floor(Math.random() * arr.length)];
-const mix = (a, b, u) => a.map((v, i) => v + (b[i] - v) * u);
-const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
-const rgb = c => `rgb(${c.map(Math.round).join(',')})`;
-
-let W, H, cols, rows, cw, chh, size, boldFont, thinFont, F, cx, cy, horizonY;
-let pts, heads, stars, dust, flies, petals, shooting, nextShoot = 0, bornAt, startAt, plantPhase = 0;
-const bloom = document.createElement('canvas'), bctx = bloom.getContext('2d'); // small copy of the frame for the glow
-const bg = document.createElement('canvas'), fg = document.createElement('canvas'); // static layers, painted once per resize
-// 2x is sharp enough for text; phones at 3x would paint 2.25x more pixels every frame for no visible gain
-const DPR = () => Math.min(2, window.devicePixelRatio || 1);
-let frameNo = 0;
-
-function resize() {
-  const box = canvas.getBoundingClientRect();
-  W = box.width; H = box.height;
-  const dpr = DPR();
-  canvas.width = W * dpr;
-  canvas.height = H * dpr;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  size = Math.max(8, Math.floor(Math.min(W / 110, H / 64)));
-  boldFont = `bold ${size}px "Courier New", monospace`;
-  thinFont = `${size}px "Courier New", monospace`;
-  ctx.font = boldFont;
-  cw = ctx.measureText('M').width;
-  chh = size * 1.05;
-  cols = Math.floor(W / cw);
-  rows = Math.floor(H / chh);
-  F = Math.min(W * 0.7, H * 0.55); // focal length in px: whole heart fits the width, sky keeps ~1/4 of the screen
-  cx = W / 2;
-  cy = H * 0.62;
-  horizonY = cy - Math.tan(PITCH) * F;
-  makeSky();
-  generate();
+<h1 id="intro">Click To Add Flowers</h1>
+<script type="module">
+const intro = document.querySelector('#intro');
+try {
+  const THREE = await import('https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js');
+  start(THREE);
+} catch (error) {
+  intro.textContent = 'The garden needs WebGL 2 and an internet connection.';
+  console.error(error);
 }
 
-// ---------- 3D -> screen ----------
-let ca = 1, sa = 0;
-const cp = Math.cos(PITCH), sp = Math.sin(PITCH);
-let PX, PY, PD; // results of project(), kept in globals to avoid garbage every frame
-function project(x, y, z) {
-  const xr = x * ca - z * sa, zr = x * sa + z * ca;   // turn the world = camera circling
-  const yc = y - CAM_H, zc = CAM_D - zr;
-  const ycam = yc * cp + zc * sp, d = zc * cp - yc * sp; // tilt down
-  if (d < 0.4) return false;
-  PX = cx + (xr / d) * F; PY = cy - (ycam / d) * F; PD = d;
-  return true;
-}
+function start(T) {
+  const renderer = new T.WebGLRenderer({ antialias: false, alpha: false });
+  renderer.autoClear = false;
+  renderer.setClearColor(0x000000, 1);
+  const canvas = renderer.domElement;
+  canvas.setAttribute('aria-label', 'Flower garden. Press Enter to plant or Space to clear.');
+  canvas.tabIndex = 0;
+  document.body.prepend(canvas);
 
-// ---------- heart shape on the ground ----------
-// Classic heart curve, scaled so it is about FIELD_R across. Returns ground [x, z].
-const HS = FIELD_R / 17;
-const heartEdge = t => [16 * Math.sin(t) ** 3 * HS, -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) * HS + 0.4];
-// Random point inside the heart: (x²+y²-1)³ - x²y³ <= 0 in unit coordinates.
-function insideHeart() {
-  for (;;) {
-    const X = rand(-1.15, 1.15), Y = rand(-1.0, 1.25);
-    if ((X * X + Y * Y - 1) ** 3 - X * X * Y ** 3 <= 0) return [X * FIELD_R * 0.9, -Y * FIELD_R * 0.9 + 0.4];
-  }
-}
+  const camera = new T.OrthographicCamera(0, 1, 1, 0, 0, 10);
+  camera.position.z = 1;
+  const plane = new T.PlaneGeometry(1, 1);
+  const backdrop = new T.Scene();
+  const paint = new T.Scene();
+  const atmosphere = new T.Scene();
+  const size = new T.Vector2();
+  const colors = [0xe0218a, 0xff4fa3, 0xff7a3d, 0x9b5cff, 0xffca57];
+  // Petal length, tip roundness, aspect ratio, and inner-ring strength.
+  const forms = [
+    { length: .60, roundness: .65, aspect: 1.04, layers: .00 }, // Rounded
+    { length: .81, roundness: 1.65, aspect: 1.12, layers: .00 }, // Star-shaped
+    { length: .46, roundness: .37, aspect: .89, layers: .42 },  // Ruffled
+    { length: .72, roundness: .95, aspect: 1.25, layers: .85 }, // Layered
+    { length: .60, roundness: .65, aspect: 1., layers: 0, tulip: true }
+  ];
+  const stemDuration = 600;
+  const bloomDuration = 800;
+  // Add ?auto=1 to the URL to enable hands-free planting for recordings.
+  const autoplay = new URLSearchParams(location.search).get('auto') === '1';
+  const active = [];
+  const finished = [];
+  let width, height, ratio, read, write;
+  let nextAuto = performance.now() + 5000;
 
-// ---------- flowers ----------
-// Pixel-art flowers. X = petal, O = centre, . = empty. Each pixel is drawn 2 characters wide,
-// because a character cell is about twice as tall as it is wide.
-const ART = {
-  small: ['.X.', 'XOX', '.X.'],
-  mid:   ['.X.X.', 'XXOXX', '.X.X.'],
-  round: ['.XXX.', 'XXOXX', '.XXX.'],
-  big:   ['..X.X..', '.XXXXX.', 'XXXOXXX', '.XXXXX.', '..X.X..'],
-  star:  ['X.X.X', '.XXX.', 'XXOXX', '.XXX.', 'X.X.X'],
-  cup:   ['X.X.X', 'XXXXX', '.XXX.'],
-  rose:  ['.XXX.', 'XOXOX', 'XXOXX', '.XXX.'],                 // rose with a curled centre
-};
-function art(name, petal, centre) {
-  const g = ART[name], h = g.length, w = g[0].length, cells = [];
-  const top = name === 'cup' ? -(h - 1) : -Math.floor(h / 2); // cup sits on the stem tip, others centre on it
-  g.forEach((row, y) => [...row].forEach((v, x) => {
-    if (v === '.') return;
-    const [ch, color] = v === 'O' && centre ? centre : petal;
-    for (let k = 0; k < 2; k++) cells.push([(x - (w - 1) / 2) * 2 + k - 1, top + y, ch, color]);
-  }));
-  return cells;
-}
-const spike = len => { const out = []; for (let dy = 0; dy < len; dy++) { out.push([0, -dy, '8', C.purple]); if (dy % 2) out.push([1, -dy, '8', C.purple]); } return out; };
-
-// Each kind has three sizes: near (big), middle (small) and far away (a single dot),
-// picked every frame from the distance, so far flowers really look far.
-const ROSE = () => { const p = ['@', C.red], c = ['@', C.deep]; return [art('rose', p, c), art('small', p, c), [[0, 0, '@', C.red]]]; };
-const KINDS = [
-  ROSE, ROSE,                                                                                                                                  // roses (twice as common)
-  () => { const p = ['o', C.white], c = ['@', C.yellow]; return [art(pick(['big', 'round']), p, c), art('small', p, c), [[0, 0, 'o', C.white]]]; },       // daisy
-  () => { const col = pick([C.pink, C.rose, C.blush]), p = ['o', col], c = ['*', C.yellow]; return [art(pick(['big', 'round']), p, c), art('small', p, c), [[0, 0, 'o', col]]]; }, // cosmos
-  () => { const col = pick([C.pink, C.rose, C.red]), p = ['@', col]; return [art('cup', p), art('small', p, p), [[0, 0, '@', col]]]; },  // tulip
-  () => { const col = pick([C.blush, C.pink, C.white]), p = ['o', col], c = ['.', C.orange]; return [art('mid', p, c), art('small', p, c), [[0, 0, 'o', col]]]; }, // little bloom
-  () => { const p = ['*', C.blue], c = ['o', C.white]; return [art('star', p, c), art('small', p, c), [[0, 0, '*', C.blue]]]; },             // cornflower
-  () => [spike(6), spike(3), [[0, 0, '8', C.purple]]],                                                                                       // lavender
-];
-
-// One 3D point. ch = null means "stem": its glyph is picked each frame from the projected slope.
-// w = how much the wind moves it (tips most), ph = its plant's wind phase.
-function P(x, y, z, ch, color, t, tan, first) {
-  pts.push({ x, y, z, ch, color, t, tan, first, ph: plantPhase, w: Math.max(0, y) ** 1.4 });
-}
-
-function stemChar(dx, dy) {
-  const a = Math.atan2(dx, -dy); // 0 = straight up on screen
-  if (Math.abs(a) < 0.3 || Math.abs(a) > Math.PI - 0.3) return '|';
-  if (Math.abs(a) > 1.25 && Math.abs(a) < Math.PI - 1.25) return '-';
-  return (a > 0) === (Math.abs(a) < Math.PI / 2) ? '/' : '\\';
-}
-
-// One flower: curved stem from the ground at (x0, z0), head of the given kind on top.
-function plant(x0, z0, kind, hMin, hMax) {
-  plantPhase = x0 * 0.8 + z0 * 0.5 + rand(-0.4, 0.4); // neighbours sway together, like a breeze passing
-  const h = rand(hMin, hMax);
-  const la = rand(0, Math.PI * 2), lean = rand(0.02, 0.12) * h;
-  const lx = Math.cos(la) * lean, lz = Math.sin(la) * lean;
-  const P0 = [x0, 0, z0], P1 = [x0, h * 0.4, z0], P2 = [x0 + lx * 0.5, h * 0.8, z0 + lz * 0.5], P3 = [x0 + lx, h - lean * 0.3, z0 + lz];
-  const dark = hex(pick(STEM_DARK)), light = hex(pick(STEM_LIGHT));
-  const grow = rand(0.3, 0.75);
-  const n = Math.ceil(h * (F / (CAM_D - FIELD_R)) / chh * 1.5) + 3;
-  let p = P0;
-  for (let i = 1; i <= n; i++) {
-    const u = i / n, v = 1 - u;
-    const b0 = v * v * v, b1 = 3 * v * v * u, b2 = 3 * v * u * u, b3 = u * u * u;
-    p = [0, 1, 2].map(k => b0 * P0[k] + b1 * P1[k] + b2 * P2[k] + b3 * P3[k]);
-    const tan = [0, 1, 2].map(k => 3 * v * v * (P1[k] - P0[k]) + 6 * v * u * (P2[k] - P1[k]) + 3 * u * u * (P3[k] - P2[k]));
-    P(p[0], p[1], p[2], null, rgb(mix(dark, light, u)), u * grow, tan, i === 1);
-    if (Math.random() < 0.06 && u > 0.2 && u < 0.7) {
-      const sd = Math.random() < 0.5 ? 1 : -1;
-      P(p[0] + sd * 0.03, p[1] + 0.01, p[2], sd > 0 ? ')' : '(', pick(LEAF), u * grow); // little leaf
+  const vertex = `
+    varying vec2 uvLocal;
+    varying vec2 pixel;
+    void main() {
+      uvLocal = uv;
+      vec4 world = modelMatrix * vec4(position, 1.);
+      pixel = world.xy;
+      gl_Position = projectionMatrix * viewMatrix * world;
     }
-  }
-  heads.push({ c: p, lods: kind(), t: grow + rand(0, 0.1), ph: plantPhase, w: Math.max(0, p[1]) ** 1.4 });
-}
+  `;
 
-function generate() {
-  pts = [];
-  heads = [];
-  const small = Math.min(W, H) < 600;
+  const copy = new T.ShaderMaterial({
+    uniforms: { image: { value: null } },
+    vertexShader: vertex,
+    fragmentShader: `
+      uniform sampler2D image;
+      varying vec2 uvLocal;
+      void main() { gl_FragColor = texture2D(image, uvLocal); }
+    `,
+    depthTest: false, depthWrite: false
+  });
+  const sheet = new T.Mesh(plane, copy);
+  backdrop.add(sheet);
 
-  // border of red roses tracing the heart
-  const border = small ? 56 : 70;
-  for (let i = 0; i < border; i++) {
-    const [x, z] = heartEdge((i / border) * Math.PI * 2);
-    plant(x + rand(-0.05, 0.05), z + rand(-0.05, 0.05), ROSE, 0.3, 0.45);
-  }
-  // inside: wildflower patches (1-3 of the same kind growing together)
-  const clumps = Math.round(small ? rand(50, 60) : rand(65, 80));
-  for (let c = 0; c < clumps; c++) {
-    const [bx, bz] = insideHeart();
-    const kind = pick(KINDS);
-    const count = 1 + Math.floor(Math.random() * 3);
-    for (let s = 0; s < count; s++) plant(bx + rand(-0.12, 0.12), bz + rand(-0.12, 0.12), Math.random() < 0.8 ? kind : pick(KINDS), 0.35, 0.75);
-  }
-  // grass tufts on the ground so it reads as a meadow, not floating flowers
-  // short ground tufts everywhere, plus taller blades (2-4 characters) that sway with the wind
-  const tufts = small ? 550 : 1300, blades = small ? 300 : 600;
-  for (let i = 0; i < tufts; i++) {
-    const r = FIELD_R * 1.3 * Math.sqrt(Math.random()), a = rand(0, Math.PI * 2);
-    plantPhase = rand(0, 6.28);
-    P(Math.cos(a) * r, rand(0, 0.04), Math.sin(a) * r + 0.3, pick([',', '"', "'", '.', '`', ',', 'v']), pick(GRASS), 0);
-  }
-  for (let i = 0; i < blades; i++) {
-    const r = FIELD_R * 1.2 * Math.sqrt(Math.random()), a = rand(0, Math.PI * 2);
-    const x = Math.cos(a) * r, z = Math.sin(a) * r + 0.3, lean = rand(-1, 1), h = rand(0.08, 0.2);
-    const color = pick([...GRASS, '#5cbf5a', '#4fae4f']), seg = 2 + Math.floor(Math.random() * 3);
-    plantPhase = x * 0.8 + z * 0.5 + rand(-0.4, 0.4); // sways with the flowers around it
-    for (let k = 0; k < seg; k++) {
-      const u = (k + 1) / seg;
-      const ch = k === seg - 1 ? "'" : Math.abs(lean) < 0.35 ? '|' : lean > 0 ? '/' : '\\';
-      P(x + lean * 0.03 * u, h * u, z, ch, color, 0);
+  const stemShader = `
+    varying vec2 pixel;
+    uniform vec2 tip;
+    uniform float bend, weight, growth, seed;
+    void main() {
+      float t = clamp(pixel.y / max(1., tip.y), 0., 1.);
+      float s = sin(3.141593 * t);
+      float x = tip.x + bend * (1. - t) + .55 * bend * s * (.45 + t);
+      float slope = (-bend + .55 * bend * (s + 3.141593 * cos(3.141593*t) * (.45+t))) / max(1., tip.y);
+      float d = abs(pixel.x - x) * inversesqrt(1. + slope*slope);
+      float w = weight * mix(1., .48, t);
+      float line = 1. - smoothstep(w * .27, w * .8 + .65, d);
+      float halo = exp(-d * d / (4.6*w*w + 2.)) * .19;
+      float end = growth * tip.y - pixel.y;
+      float reveal = smoothstep(-1., 1.5, end) * step(.0001, growth);
+      float alpha = (line * .86 + halo * (1. - line)) * reveal;
+      vec3 green = mix(vec3(.09,.33,.14), vec3(.46,.80,.29), .28 + .53*t);
+      green *= .90 + .10*sin(t * 27. + seed);
+      gl_FragColor = vec4(green * alpha, alpha);
     }
-  }
-  // ring of trees around the garden, outside the camera's circle so they never block the heart.
-  // About a third are pink cherry-blossom trees.
-  const trees = small ? 26 : 36;
-  for (let i = 0; i < trees; i++) {
-    const a = (i / trees) * Math.PI * 2 + rand(-0.08, 0.08), r = rand(7.2, 9);
-    const x = Math.cos(a) * r, z = Math.sin(a) * r + 0.3;
-    const h = rand(1.6, 2.6), cr = rand(0.8, 1.25), blossom = Math.random() < 0.35;
-    plantPhase = rand(0, 6.28);
-    for (let y = 0; y < h; y += 0.08) P(x, y, z, '|', '#6b4a2b', 0);                // trunk
-    const leaves = blossom ? ['#ff9fc0', '#ffb8d0', '#f27aa6', '#ffd1e0'] : ['#1f5e33', '#2a7a3f', '#3d8f4e', '#2f6b3a'];
-    for (let k = 0, nk = small ? 80 : 130; k < nk; k++) {                         // round canopy
-      const u = rand(-1, 1), th = rand(0, Math.PI * 2), rr = cr * Math.cbrt(Math.random());
-      const sq = Math.sqrt(1 - u * u);
-      P(x + Math.cos(th) * sq * rr, h + u * rr * 0.85, z + Math.sin(th) * sq * rr, pick(blossom ? ['@', '*', 'o', '%'] : ['&', '%', '@', '#']), pick(leaves), 0);
+  `;
+
+  const bloomShader = `
+    varying vec2 pixel;
+    uniform vec2 tip;
+    uniform vec3 tint;
+    uniform float radius, petals, rotation, growth, seed;
+    uniform float lengthOfPetal, roundness, aspect, layers, centerSize, tulip;
+
+    float hash(vec2 p) {
+      vec3 q = fract(vec3(p.xyx) * .1031);
+      q += dot(q, q.yzx + 33.33);
+      return fract((q.x + q.y) * q.z);
     }
-  }
-  bornAt = performance.now();
-}
-
-// ---------- sky ----------
-function makeSky() {
-  dust = Array.from({ length: Math.round(W * H / 2500) }, () => ({
-    x: rand(0, W), y: rand(0, H), r: rand(0.4, 1.1), a: rand(0.15, 0.5), ph: rand(0, 6.28), sp: rand(0.3, 1.2),
-  }));
-  stars = Array.from({ length: Math.round(cols * rows / 200) }, () => ({
-    x: Math.floor(rand(0, cols)), y: Math.floor(rand(0, rows)),
-    ch: pick(STAR_CHARS), color: pick(STAR_COLORS), ph: rand(0, 6.28), sp: rand(0.5, 1.6), glow: Math.random() < 0.15,
-  }));
-  flies = Array.from({ length: Math.max(14, Math.round(W * H / 36000)) }, () => ({
-    x: rand(0, 1), y: rand(0, 1), ph: rand(0, 6.28), ph2: rand(0, 6.28), sp: rand(0.6, 1.4),
-    rise: rand(4, 10), color: pick(FLY_COLORS),
-    b: Math.random() < 0.85 ? 0 : 1, px: Math.max(6, Math.round(size * rand(0.6, 0.8))),
-  }));
-  heartCache.clear(); // glyph size changes with the window
-  moonSprite = null;
-  msgCache = { shown: -1, c: null }; // font size changes with the window
-  petals = Array.from({ length: Math.max(18, Math.round(W * H / 30000)) }, () => ({
-    x: rand(0, 1), y: rand(0, 1), sp: rand(12, 28), drift: rand(8, 22), ph: rand(0, 6.28),
-    ch: pick(['o', '°', "'", '`', 'o']), color: pick(['#ffb3cc', '#ff8fb8', '#ffd6e3', '#ff6f9f']), a: rand(0.4, 0.85),
-  }));
-  bloom.width = Math.max(1, Math.round(W / 6)); bloom.height = Math.max(1, Math.round(H / 6));
-  paintStatic();
-}
-
-// Pixel moon made of characters, drawn once with a soft glow.
-const MOON = ['...####.', '.####...', '###.....', '##......', '##......', '###.....', '.####...', '...####.']; // crescent
-let moonSprite = null;
-function moon() {
-  if (moonSprite) return moonSprite;
-  const px = Math.max(8, Math.round(size * 0.95)), gw = px * 0.62, pad = 30, dpr = DPR();
-  const c = document.createElement('canvas');
-  c.cssW = Math.ceil(MOON[0].length * 2 * gw + pad * 2); c.cssH = Math.ceil(MOON.length * px + pad * 2);
-  c.width = Math.ceil(c.cssW * dpr); c.height = Math.ceil(c.cssH * dpr);
-  const g = c.getContext('2d');
-  g.scale(dpr, dpr);
-  g.font = `bold ${px}px "Courier New", monospace`;
-  g.textBaseline = 'top';
-  g.fillStyle = '#fff4e0'; g.shadowColor = '#ffd9b0'; g.shadowBlur = 18;
-  MOON.forEach((row, y) => [...row].forEach((v, x) => {
-    if (v === '#') for (let k = 0; k < 2; k++) g.fillText((x + y) % 5 ? 'o' : '.', pad + (x * 2 + k) * gw, pad + y * px);
-  }));
-  return (moonSprite = c);
-}
-
-function drawSky(now, buf) {
-  const t = STILL ? 0 : now / 1000;
-  // sky: deep navy fading to a warm rose glow at the horizon
-  ctx.globalAlpha = 1;
-  ctx.drawImage(bg, 0, 0, W, H); // sky, ground, moon, mist: painted once in paintStatic()
-
-  for (const d of dust) {
-    if (d.y > horizonY) continue;
-    ctx.globalAlpha = d.a * (0.6 + 0.4 * Math.sin(t * d.sp + d.ph));
-    ctx.fillStyle = '#ffe6f0';
-    ctx.fillRect(d.x, d.y, d.r, d.r);
-  }
-  ctx.font = thinFont;
-  for (const st of stars) {
-    if (st.y * chh > horizonY - chh * 2 || buf.has(st.y * cols + st.x)) continue;
-    const tw = Math.max(0, Math.sin(t * st.sp + st.ph));
-    ctx.globalAlpha = STILL ? 0.6 : 0.15 + 0.85 * tw * tw;
-    ctx.fillStyle = st.color;
-    ctx.fillText(st.glow ? '✦' : st.ch, st.x * cw, st.y * chh); // the glow pass makes these shine, no live blur needed
-  }
-
-  if (!STILL) {
-    if (!shooting && now > nextShoot) {
-      shooting = { t0: now, x: rand(0.1, 0.9) * W, y: rand(0.02, 0.5) * horizonY, dx: Math.random() < 0.5 ? -1 : 1 };
+    float noise(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      f = f*f*(3.-2.*f);
+      return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+                 mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
     }
-    if (shooting) {
-      const k = (now - shooting.t0) / 900;
-      if (k > 1) { shooting = null; nextShoot = now + rand(5000, 11000); }
-      else {
-        const len = Math.min(W, H) * 0.25;
-        const hx = shooting.x + shooting.dx * len * k * 1.5, hy = shooting.y + len * k * 0.6;
-        const gr = ctx.createLinearGradient(hx, hy, hx - shooting.dx * len * 0.5, hy - len * 0.2);
-        gr.addColorStop(0, 'rgba(255,240,245,0.9)'); gr.addColorStop(1, 'rgba(255,240,245,0)');
-        ctx.globalAlpha = 1 - k;
-        ctx.strokeStyle = gr; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx - shooting.dx * len * 0.5, hy - len * 0.2); ctx.stroke();
+
+    void main() {
+      float open = 1. - pow(1. - growth, 3.);
+      vec2 p = (pixel - tip) / (radius * mix(.12, 1., open));
+      if (tulip > .5) {
+        p.x += .13 * sin(seed) * p.y;
+        p.x /= mix(.60, 1., open);
+        float y = p.y + .13;
+        float x = abs(p.x);
+        float width = .59 * sqrt(clamp((y+.16)*1.65, 0., 1.)) * (1.-.24*y);
+        float crown = .82 - .33*x + .075*cos(p.x*15.);
+        float grain = noise(p*28. + seed);
+        float edge = max(x-width, max(y-crown, -.16-y)) + .023*(grain-.5);
+        float cup = 1.-smoothstep(-.055,.045,edge);
+        float halo = .15*exp(-14.*max(0.,edge));
+        float seamX = .11 + .32*smoothstep(-.11,.83,y);
+        float seam = exp(-29.*abs(x-seamX)) * smoothstep(-.13,.37,y);
+        float front = 1.-smoothstep(seamX-.05,seamX+.06,x);
+        float wash = noise(p*6. + seed);
+        vec2 throat = p - vec2(0.,.44);
+        float warm = exp(-11.*dot(throat,throat));
+        vec3 color = tint * (.65 + .35*front + .15*wash);
+        color = mix(color, vec3(1.,.77,.41), warm*.77);
+        color = mix(color, vec3(1.,.91,.76), .28*seam);
+        float alpha = (cup*(.78+.16*wash) + (1.-cup)*halo) * smoothstep(0.,.24,growth);
+        gl_FragColor = vec4(color*alpha,alpha);
+        return;
+      }
+      float tilt = sin(seed) * .65;
+      float c = cos(tilt), s = sin(tilt);
+      p = mat2(c, s, -s, c) * p;
+      p.y *= aspect;
+      float r = length(p);
+      if (r > 1.7) discard;
+      float angle = atan(p.y, p.x + .00001) + rotation + (1. - open)*.40;
+      float grain = noise(p*37. + seed);
+      float wash = noise(p*8.6 + seed);
+      float phase = petals*angle + .22*sin(3.*angle + seed) + .18*(wash-.5);
+      float lobe = .5 + .5*cos(phase);
+      float spread = lengthOfPetal * (.85 + .15 * sin(angle*3. + seed));
+      float edge = 1. - lengthOfPetal + spread*pow(lobe, roundness);
+      edge += .050*(wash-.5) + .024*(grain-.5) + .048*sin(3.*angle + seed);
+      float veil = 1. - smoothstep(edge-.14, edge+.07, r);
+      float innerLobe = .5 + .5*cos(phase + 2.7);
+      float innerEdge = .21 + .46*pow(innerLobe, .72) + .06*(wash-.5);
+      float inner = layers * (1. - smoothstep(innerEdge-.075, innerEdge+.04, r));
+      float rimDistance = (r-innerEdge)*29.;
+      float rim = layers * exp(-rimDistance*rimDistance) * .24;
+      float fibers = sin(petals*7.*angle + 9.*wash + 12.*r) * .5 + .5;
+      float pigment = (.65 + .23*wash + .13*fibers) * (.89 + .18*grain);
+      float glow = .22*exp(-pow(max(0.,r-edge)*5.2,1.5)) * exp(-1.4*r*r);
+      float center = r / centerSize;
+      float core = exp(-center*center*10.);
+      float heart = exp(-center*center*92.);
+      float pollen = step(.69, grain) * smoothstep(.07,.13,center)
+                   * (1.-smoothstep(.20,.29,center));
+      float opacity = smoothstep(0., .24, growth);
+      float alpha = min(1., veil*pigment*.91 + glow*(1.-veil) + .10*inner + rim + .11*heart) * opacity;
+      vec3 color = mix(tint * (.85 + .23*lobe), vec3(1., .72, .29), core*.86);
+      color = mix(color, mix(tint, vec3(1., .71, .76), .55), (inner*.25 + rim) * (1.-core));
+      color = mix(color, vec3(1., .98, .83), max(heart*.92, pollen*.70));
+      gl_FragColor = vec4(color * alpha, alpha);
+    }
+  `;
+
+  function brush(fragmentShader, uniforms) {
+    return new T.Mesh(plane, new T.ShaderMaterial({
+      vertexShader: vertex, fragmentShader, uniforms, transparent: true,
+      premultipliedAlpha: true, depthTest: false, depthWrite: false
+    }));
+  }
+
+  function place(mesh, x, y, w, h) {
+    mesh.position.set(x, y, 0);
+    mesh.scale.set(w, h, 1);
+  }
+
+  function mark(flower) {
+    const tip = { value: new T.Vector2(flower.x * width, flower.y * height) };
+    const seed = { value: flower.seed };
+    const stemGrowth = { value: 0 };
+    const bloomGrowth = { value: 0 };
+    const unit = Math.min(width, height * .9);
+    const bend = flower.bend * unit;
+    const weight = Math.max(.8, Math.min(2.5, unit / 320)) * flower.weight;
+    const radius = Math.max(18, unit * flower.radius);
+    const [x, y] = tip.value;
+    const stem = brush(stemShader, {
+      tip, seed, growth: stemGrowth, bend: { value: bend }, weight: { value: weight }
+    });
+    const left = Math.min(x, x + bend) - 12;
+    const right = Math.max(x, x + bend) + 12;
+    place(stem, (left + right) / 2, (y + 2) / 2, right - left, y + 2);
+    const bloom = brush(bloomShader, {
+      tip, seed, growth: bloomGrowth, radius: { value: radius },
+      tint: { value: new T.Color().setHex(flower.color, T.LinearSRGBColorSpace) },
+      petals: { value: flower.petals }, rotation: { value: flower.rotation },
+      lengthOfPetal: { value: flower.form.length }, roundness: { value: flower.form.roundness },
+      aspect: { value: flower.form.aspect }, layers: { value: flower.form.layers },
+      centerSize: { value: flower.centerSize }, tulip: { value: Number(!!flower.form.tulip) }
+    });
+    place(bloom, x, y, radius * 3.9, radius * 3.9);
+    return { stem, bloom, stemGrowth, bloomGrowth };
+  }
+
+  function addMark(brushes, progress, order) {
+    const stem = Math.min(1, Math.max(0, progress / stemDuration));
+    brushes.stemGrowth.value = stem * (2 - stem);
+    brushes.bloomGrowth.value = Math.min(1, Math.max(0, (progress - stemDuration) / bloomDuration));
+    brushes.stem.renderOrder = order * 2;
+    brushes.bloom.renderOrder = order * 2 + 1;
+    paint.add(brushes.stem);
+    if (brushes.bloomGrowth.value > 0) paint.add(brushes.bloom);
+  }
+
+  function dispose(brushes) {
+    brushes.stem.material.dispose();
+    brushes.bloom.material.dispose();
+  }
+
+  function pass(source, target) {
+    renderer.setRenderTarget(target);
+    if (source) {
+      copy.uniforms.image.value = source.texture;
+      renderer.render(backdrop, camera);
+    } else {
+      renderer.clearColor();
+    }
+    if (paint.children.length) renderer.render(paint, camera);
+    paint.clear();
+  }
+
+  const random = Math.random;
+  const positions = new Float32Array(60 * 3);
+  const seeds = new Float32Array(60);
+  for (let i = 0; i < seeds.length; i++) {
+    positions[3*i] = random();
+    positions[3*i+1] = random();
+    seeds[i] = random();
+  }
+  const sparkGeo = new T.BufferGeometry();
+  sparkGeo.setAttribute('position', new T.BufferAttribute(positions, 3));
+  sparkGeo.setAttribute('seed', new T.BufferAttribute(seeds, 1));
+  const sparkMaterial = new T.ShaderMaterial({
+    uniforms: { time: { value: 0 }, dpr: { value: 1 } },
+    vertexShader: `
+      attribute float seed;
+      uniform float time, dpr;
+      varying float light;
+      void main() {
+        vec2 p = fract(position.xy + vec2(.017*sin(time*.36+seed*28.), time*(.008+.008*seed)));
+        light = (.15+.53*pow(.5+.5*sin(time*(1.1+seed)+seed*51.), 2.))
+                * smoothstep(0.,.025,p.y) * smoothstep(0.,.025,1.-p.y);
+        gl_Position = vec4(p*2.-1.,0.,1.);
+        gl_PointSize = dpr*(2.1+2.5*seed);
+      }
+    `,
+    fragmentShader: `
+      varying float light;
+      void main() {
+        float d = length(gl_PointCoord-.5);
+        float a = (exp(-d*d*37.)*.85 + .15*(1.-smoothstep(.18,.49,d))) * light;
+        gl_FragColor = vec4(1.,1.,1.,a);
+      }
+    `,
+    transparent: true, depthTest: false, depthWrite: false
+  });
+  const sparkles = new T.Points(sparkGeo, sparkMaterial);
+  sparkles.frustumCulled = false;
+  atmosphere.add(sparkles);
+
+  function resize() {
+    width = Math.max(1, innerWidth);
+    height = Math.max(1, innerHeight);
+    ratio = Math.min(devicePixelRatio || 1, 2);
+    renderer.setPixelRatio(ratio);
+    renderer.setSize(width, height);
+    renderer.getDrawingBufferSize(size);
+    camera.right = width;
+    camera.top = height;
+    camera.updateProjectionMatrix();
+    place(sheet, width / 2, height / 2, width, height);
+    sparkMaterial.uniforms.dpr.value = ratio;
+
+    read?.dispose();
+    write?.dispose();
+    const options = { depthBuffer: false, stencilBuffer: false };
+    read = new T.WebGLRenderTarget(size.x, size.y, options);
+    write = new T.WebGLRenderTarget(size.x, size.y, options);
+    const replay = finished.map(mark);
+    replay.forEach((brushes, index) => addMark(brushes, stemDuration + bloomDuration, index));
+    pass(null, read);
+    replay.forEach(dispose);
+    for (const flower of active) {
+      dispose(flower.brushes);
+      flower.brushes = mark(flower);
+    }
+    renderer.setRenderTarget(null);
+  }
+
+  function plant(x, y, now) {
+    const flower = {
+      x, y, time: now, color: colors[Math.floor(random() * colors.length)],
+      bend: (random() - .5) * .29, weight: .79 + random() * .45,
+      radius: .032 + random() * .064, seed: random() * 90,
+      form: forms[Math.floor(random() * forms.length)], centerSize: .69 + .55 * random(),
+      petals: 5 + Math.floor(random() * 4), rotation: random() * Math.PI * 2
+    };
+    flower.brushes = mark(flower);
+    active.push(flower);
+    intro.classList.add('hidden');
+  }
+
+  function recordInput(now) {
+    nextAuto = now + 5000;
+  }
+
+  canvas.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const now = performance.now();
+    recordInput(now);
+    const bounds = canvas.getBoundingClientRect();
+    plant((event.clientX - bounds.left) / bounds.width, 1 - (event.clientY - bounds.top) / bounds.height, now);
+  });
+
+  addEventListener('keydown', (event) => {
+    if (event.code !== 'Space' && event.code !== 'Enter') return;
+    event.preventDefault();
+    if (event.repeat) return;
+    const now = performance.now();
+    recordInput(now);
+    if (event.code === 'Enter') {
+      plant(.12 + random() * .76, .18 + random() * .68, now);
+      return;
+    }
+    active.forEach((flower) => dispose(flower.brushes));
+    active.length = 0;
+    finished.length = 0;
+    pass(null, read);
+    pass(null, write);
+    renderer.setRenderTarget(null);
+    intro.classList.remove('hidden');
+  });
+
+  function frame(now) {
+    if (ratio !== Math.min(devicePixelRatio || 1, 2)) resize();
+    if (autoplay && now >= nextAuto) {
+      plant(.09 + random() * .82, .17 + random() * .70, now);
+      nextAuto = now + 1500;
+    }
+
+    // Commit each completed flower once. The other target holds a fresh
+    // composite during growth, so translucent brush edges never build up.
+    let committed = 0;
+    while (committed < active.length && now - active[committed].time >= stemDuration + bloomDuration) {
+      const flower = active[committed];
+      addMark(flower.brushes, stemDuration + bloomDuration, committed);
+      committed++;
+    }
+    if (committed) {
+      pass(read, write);
+      [read, write] = [write, read];
+      for (const flower of active.splice(0, committed)) {
+        dispose(flower.brushes);
+        delete flower.brushes;
+        finished.push(flower);
       }
     }
-  }
-}
 
-// ---------- heart fireflies ----------
-const HEART_BITMAPS = [
-  ['.#.#.', '#####', '.###.', '..#..'],
-  ['.##.##.', '#######', '#######', '.#####.', '..###..', '...#...'],
-];
-const heartCache = new Map();
-// Draw each heart once to an offscreen canvas (at the screen's real pixel density, so it stays sharp), then reuse it.
-function heartSprite(b, color, px) {
-  const key = b + color + px;
-  if (heartCache.has(key)) return heartCache.get(key);
-  const rowsB = HEART_BITMAPS[b], gw = px * 0.62, gh = px, pad = 10;
-  const dpr = DPR(), c = document.createElement('canvas');
-  c.cssW = Math.ceil(rowsB[0].length * gw + pad * 2);
-  c.cssH = Math.ceil(rowsB.length * gh + pad * 2);
-  c.width = Math.ceil(c.cssW * dpr);
-  c.height = Math.ceil(c.cssH * dpr);
-  const g = c.getContext('2d');
-  g.scale(dpr, dpr);
-  g.font = `bold ${px}px "Courier New", monospace`;
-  g.textBaseline = 'top';
-  g.fillStyle = color;
-  g.shadowColor = color;
-  g.shadowBlur = 2;
-  rowsB.forEach((row, y) => [...row].forEach((v, x) => {
-    if (v === '#') g.fillText(x + y < 2 ? '+' : '#', pad + x * gw, pad + y * gh); // '+' = little highlight
-  }));
-  heartCache.set(key, c);
-  return c;
-}
-
-function drawFlies(now) {
-  const t = STILL ? 0 : now / 1000;
-  for (const f of flies) {
-    const span = H + 40;
-    const x = f.x * W + Math.sin(t * 0.35 * f.sp + f.ph) * 45 + Math.sin(t * 0.9 + f.ph2) * 12;
-    const y = (((f.y * span - t * f.rise) % span) + span) % span - 20 + Math.cos(t * 0.5 * f.sp + f.ph) * 18;
-    const pulse = STILL ? 0.7 : Math.max(0, Math.sin(t * 1.3 * f.sp + f.ph)) ** 2;
-    ctx.globalAlpha = 0.3 + 0.7 * pulse;
-    const spr = heartSprite(f.b, f.color, f.px);
-    ctx.drawImage(spr, Math.round(x - spr.cssW / 2), Math.round(y - spr.cssH / 2), spr.cssW, spr.cssH);
-  }
-}
-
-// Pink petals drifting down and sideways, fluttering.
-function drawPetals(now) {
-  const t = STILL ? 0 : now / 1000;
-  ctx.font = boldFont;
-  for (const p of petals) {
-    const span = H + 40;
-    const y = ((p.y * span + t * p.sp) % span) - 20;
-    const x = ((p.x * W + t * p.drift + Math.sin(t * 1.2 + p.ph) * 18) % (W + 20) + W + 20) % (W + 20) - 10;
-    ctx.globalAlpha = p.a * (0.6 + 0.4 * Math.sin(t * 2 + p.ph)); // flutter
-    ctx.fillStyle = p.color;
-    ctx.fillText(p.ch, x, y);
-  }
-}
-
-// Finishing touches: rose mist on the horizon, a soft glow over everything, darker edges.
-function drawFinish() {
-  // glow: shrink the frame 6x and lay it back on top, brightened; the upscale blurs it for free.
-  // Refreshed every other frame; nobody can see a 1-frame lag in a blur.
-  if (frameNo++ % 2 === 0) {
-    bctx.clearRect(0, 0, bloom.width, bloom.height);
-    bctx.drawImage(canvas, 0, 0, bloom.width, bloom.height);
-  }
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.globalAlpha = 0.32;
-  ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(bloom, 0, 0, W, H);
-  ctx.globalCompositeOperation = 'source-over';
-
-  ctx.globalAlpha = 1;
-  ctx.drawImage(fg, 0, 0, W, H); // darker edges, painted once
-}
-
-// Things that never move are painted once per resize into two layers, not every frame.
-function paintStatic() {
-  const dpr = DPR();
-  for (const c of [bg, fg]) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
-  let g = bg.getContext('2d');
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const s = g.createLinearGradient(0, 0, 0, horizonY);   // sky: deep navy fading to a warm rose glow
-  s.addColorStop(0, SKY_TOP); s.addColorStop(0.75, SKY_LOW); s.addColorStop(1, GLOW);
-  g.fillStyle = s; g.fillRect(0, 0, W, horizonY);
-  const gr = g.createLinearGradient(0, horizonY, 0, H);  // ground
-  gr.addColorStop(0, GLOW); gr.addColorStop(0.12, '#2a1a35'); gr.addColorStop(1, GROUND);
-  g.fillStyle = gr; g.fillRect(0, horizonY, W, H - horizonY);
-  const m = moon(), mx = W * 0.78, my = horizonY * 0.32;
-  const halo = g.createRadialGradient(mx, my, 0, mx, my, m.cssW * 1.6); // soft moonlight halo
-  halo.addColorStop(0, 'rgba(255,225,235,0.28)'); halo.addColorStop(1, 'rgba(255,225,235,0)');
-  g.fillStyle = halo; g.fillRect(mx - m.cssW * 1.6, my - m.cssW * 1.6, m.cssW * 3.2, m.cssW * 3.2);
-  g.globalAlpha = 0.95;
-  g.drawImage(m, Math.round(mx - m.cssW / 2), Math.round(my - m.cssH / 2), m.cssW, m.cssH);
-  g.globalAlpha = 1;
-  const mist = g.createLinearGradient(0, horizonY - H * 0.06, 0, horizonY + H * 0.14); // rose mist on the horizon
-  mist.addColorStop(0, 'rgba(255,150,190,0)'); mist.addColorStop(0.45, 'rgba(255,150,190,0.14)'); mist.addColorStop(1, 'rgba(255,150,190,0)');
-  g.fillStyle = mist; g.fillRect(0, horizonY - H * 0.06, W, H * 0.2);
-
-  g = fg.getContext('2d');
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const v = g.createRadialGradient(W / 2, H * 0.55, Math.min(W, H) * 0.35, W / 2, H * 0.55, Math.max(W, H) * 0.75);
-  v.addColorStop(0, 'rgba(8,4,18,0)'); v.addColorStop(1, 'rgba(8,4,18,0.6)');
-  g.fillStyle = v; g.fillRect(0, 0, W, H);
-}
-
-// The message types itself out after the garden has grown, then glows softly.
-// Each typed length is drawn once (with its glow) into a small canvas and reused, so no live blur per frame.
-let msgCache = { shown: -1, c: null };
-function drawMessage(now) {
-  const chars = [...MESSAGE];
-  const shown = STILL ? chars.length : Math.max(0, Math.min(chars.length, Math.floor((now - startAt - 1800) / 110)));
-  if (!shown) return;
-  if (msgCache.shown !== shown || !msgCache.c) {
-    const dpr = DPR(), fs = Math.round(size * 1.35), font = `bold ${fs}px "Courier New", monospace`;
-    ctx.font = font;
-    const full = Math.min(ctx.measureText(MESSAGE).width, W - 32), pad = 16;
-    const c = msgCache.c || document.createElement('canvas');
-    c.cssW = Math.ceil(full + pad * 2); c.cssH = Math.ceil(fs * 1.4 + pad * 2);
-    c.width = Math.ceil(c.cssW * dpr); c.height = Math.ceil(c.cssH * dpr);
-    const g = c.getContext('2d');
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.font = font; g.textBaseline = 'top';
-    g.fillStyle = C.blush; g.shadowColor = C.rose; g.shadowBlur = 12;
-    g.fillText(chars.slice(0, shown).join(''), pad, pad, full); // left edge stays put while typing
-    msgCache = { shown, c };
-  }
-  const c = msgCache.c;
-  ctx.globalAlpha = STILL ? 1 : 0.88 + 0.12 * Math.sin(now / 900); // gentle breathing glow
-  ctx.drawImage(c, Math.round(W / 2 - c.cssW / 2), Math.round(H - chh * 3.2 - 16), c.cssW, c.cssH);
-  ctx.globalAlpha = 1;
-}
-
-// ---------- frame ----------
-function draw(now) {
-  const grown = STILL ? 1 : Math.min(1, (now - bornAt) / 1500); // garden grows in over 1.5 s
-  const ang = STILL ? 0.6 : now * ORBIT;
-  ca = Math.cos(ang); sa = Math.sin(ang);
-  const wind = STILL ? 0 : now / 1300;
-  const fog = d => Math.min(1, Math.max(0.55, 1.4 - d / 12)); // far away = fainter, but trees stay visible
-
-  // Stems, leaves, grass: project each point, keep the nearest one per character cell (z-buffer).
-  const buf = new Map();
-  let lastX = 0, lastY = 0, haveLast = false; // previous point of the current stem, for its slope
-  for (const p of pts) {
-    if (p.first) haveLast = false;
-    if (p.t > grown) continue;
-    const sway = Math.sin(wind + p.ph) * 0.06 * p.w;
-    if (!project(p.x + sway, p.y, p.z + sway * 0.5)) { haveLast = false; continue; }
-    const prevX = lastX, prevY = lastY, hadPrev = haveLast;
-    if (p.tan) { lastX = PX; lastY = PY; haveLast = true; }
-    const fx = PX / cw, gx = Math.round(fx), gy = Math.round(PY / chh);
-    if (gx < 0 || gy < 0 || gx >= cols || gy >= rows - 4) continue;
-    const key = gy * cols + gx, old = buf.get(key);
-    if (old && old.D <= PD) continue;
-    let ch = p.ch;
-    const D = PD;
-    if (!ch) ch = hadPrev ? stemChar((PX - prevX) / cw, (PY - prevY) / chh) : '|'; // stem glyph from its slope on screen
-    buf.set(key, { fx, gy, D, ch, color: p.color, stem: !p.ch });
-  }
-
-  // Flowers: whole shapes, far ones first so nearer flowers cover them. Size picked by distance.
-  const hs = [];
-  for (const h of heads) {
-    if (h.t > grown) continue;
-    const sway = Math.sin(wind + h.ph) * 0.06 * h.w;
-    if (!project(h.c[0] + sway, h.c[1], h.c[2] + sway * 0.5)) continue;
-    const rowsR = (0.13 * F) / PD / chh; // a flower's on-screen size in character rows at this distance
-    const lod = rowsR > 1.4 ? 0 : rowsR > 0.55 ? 1 : 2;
-    hs.push({ fx: PX / cw, gy: Math.round(PY / chh), D: PD, cells: h.lods[lod] });
-  }
-  hs.sort((a, b) => b.D - a.D);
-  for (const { fx, gy, D, cells } of hs) {
-    const gx = Math.round(fx);
-    for (const [dx, dy, ch, color] of cells) {
-      const x = gx + dx, y = gy + dy;
-      if (x < 0 || y < 0 || x >= cols || y >= rows - 4) continue;
-      const key = y * cols + x, old = buf.get(key);
-      if (old && !old.head && old.D < D - 0.25) continue; // a stem clearly in front still hides it
-      buf.set(key, { fx: fx + dx, gy: y, D, ch, color, head: true });
+    let visible = read;
+    if (active.length) {
+      active.forEach((flower, index) => addMark(flower.brushes, now - flower.time, index));
+      pass(read, write);
+      visible = write;
     }
+    pass(visible, null);
+    sparkMaterial.uniforms.time.value = now * .001;
+    renderer.render(atmosphere, camera);
+    requestAnimationFrame(frame);
   }
 
-  ctx.textBaseline = 'top';
-  drawSky(now, buf);
-
-  // stems/grass thin, blooms bold on top
-  for (const pass of [0, 1]) {
-    ctx.font = pass ? boldFont : thinFont;
-    for (const e of buf.values()) {
-      if (!!e.head !== !!pass) continue;
-      ctx.globalAlpha = fog(e.D) * (e.stem ? 0.9 : 1);
-      ctx.fillStyle = e.color;
-      ctx.fillText(e.ch, e.fx * cw, e.gy * chh);
-    }
-  }
-
-  drawPetals(now);
-  drawFlies(now);
-  drawFinish();
-  drawMessage(now);
-  ctx.textAlign = 'left';
-  requestAnimationFrame(draw);
+  addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
 }
-
-addEventListener('resize', resize);
-addEventListener('keydown', e => { if (!e.repeat) generate(); });
-canvas.addEventListener('pointerdown', generate);
-startAt = performance.now();
-resize();
-requestAnimationFrame(draw);
 </script>
 </body>
 </html>
